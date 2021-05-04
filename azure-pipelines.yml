@@ -1,0 +1,93 @@
+# IaC Starter pipeline
+
+trigger:
+  none
+  # branches:
+  #   include:
+  #   - master
+  #   exclude:
+  #   - user/*
+
+variables:
+- group: expertdays-vg
+
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: Build
+    displayName: Build job
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: PublishPipelineArtifact@0
+      inputs:
+        targetPath: 'tf'
+        artifactName: 'terraform'
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy job
+    environment: test
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@1
+            inputs:
+              artifactName: 'terraform'
+              downloadPath: '$(System.ArtifactsDirectory)/terraform'
+
+          - task: AzureCLI@1
+            inputs:
+              # Change here if you changed name for Service Connection
+              azureSubscription: 'serviceprincipal'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              inlineScript: |
+                ACCESS_KEY=`az storage account keys list -n $(TF_STG_NAME) -o json | jq -r ''.[0].value''`
+                TENANT_ID=`az account show -o json | jq -r ''.tenantId''`
+                SUBSCRIPTION_ID=`az account show -o json | jq -r ''.id''`
+                echo "##vso[task.setvariable variable=accessKey]$ACCESS_KEY"
+                echo "##vso[task.setvariable variable=ARM_TENANT_ID]$TENANT_ID"
+                echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$SUBSCRIPTION_ID"
+                echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$servicePrincipalId"
+                echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET]$servicePrincipalKey"
+            displayName: 'Retrieve credentials'
+          
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                terraform init -backend-config=resource_group_name=$(TF_STATE_RG) -backend-config=storage_account_name=$(TF_STG_NAME) -backend-config=container_name=state -backend-config=key=$(TF_STG_KEY) -backend-config=access_key=$(accessKey) -no-color -input=false
+                terraform plan -var cluster_sp_client_id=$(ARM_CLIENT_ID) -var cluster_sp_client_secret=$(ARM_CLIENT_SECRET) -var resource_group_name=$(RESOURCE_GROUP_NAME) -var 'location=$(LOCATION)' -var cluster_name=$(AKS_CLUSTER_NAME) -var cluster_node_count=$(CLUSTER_NODE_COUNT) -var cluster_node_vm_size=$(CLUSTER_NODE_SIZE) -no-color -input=false
+                terraform apply -var cluster_sp_client_id=$(ARM_CLIENT_ID) -var cluster_sp_client_secret=$(ARM_CLIENT_SECRET) -var resource_group_name=$(RESOURCE_GROUP_NAME) -var 'location=$(LOCATION)' -var cluster_name=$(AKS_CLUSTER_NAME) -var cluster_node_count=$(CLUSTER_NODE_COUNT) -var cluster_node_vm_size=$(CLUSTER_NODE_SIZE) -auto-approve
+                echo "set output variables"
+                echo "##vso[task.setvariable variable=AKS_CLUSTER_NAME]$(terraform output cluster_name)"
+                echo "##vso[task.setvariable variable=AKS_CLUSTER_RG]$(terraform output cluster_rg)"
+                echo "##vso[task.setvariable variable=LOG_WS_ID]$(terraform output log_ws_id)"
+                echo "##vso[task.setvariable variable=ACR_ID]$(terraform output acr_id)"
+              workingDirectory: '$(System.ArtifactsDirectory)/terraform'
+            displayName: 'Create Azure Resources with Terraform'
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: 'serviceprincipal'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "enabled Azure Monitor Agent if not enabled"
+                OMS_ON=$(az aks show -n $(AKS_CLUSTER_NAME) -g $(AKS_CLUSTER_RG) | jq '.addonProfiles.omsagent.enabled')
+                echo $OMS_ON
+                if [ $OMS_ON != 'true' ]; then az aks enable-addons -a monitoring -n $(AKS_CLUSTER_NAME) -g $(AKS_CLUSTER_RG) --workspace-resource-id $(LOG_WS_ID) --debug; fi
+                echo "attach the Container Registry"
+                OBJ_ID=$(az aks show -n expertdaysakscluster -g expertdaysaksdemo | jq '.identityProfile.kubeletidentity.objectId' -r)
+                az role assignment create --assignee-object-id $OBJ_ID --role 'AcrPull' --scope $(ACR_ID)
+              workingDirectory: '$(System.ArtifactsDirectory)/terraform'
+            displayName: 'Enable Azure Monitor and attach ACR'
+
